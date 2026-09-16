@@ -10,14 +10,6 @@ gleam推荐以不变性优先，建议只在确实需要可变性时才使用
 ```sh
 gleam add variable
 ```
-```gleam
-import var
-
-pub fn main() {
-    use val <- var.scope(5, 1000)
-    // ...
-}
-```
 
 ## Development
 

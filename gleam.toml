@@ -1,0 +1,21 @@
+name = "variable"
+version = "0.3.0"
+
+target = "erlang"
+
+description = "otp进程模拟的可变值"
+licences = ["Apache-2.0"]
+
+[repository]
+type = "github"
+user = "CGuoXYZ"
+repo = "variable--gleam-"
+
+[dependencies]
+gleam_stdlib = ">= 1.0.0 and < 2.0.0"
+gleam_erlang = ">= 1.3.0 and < 2.0.0"
+gleam_otp = ">= 1.3.0 and < 2.0.0"
+shine_try = ">= 0.3.2 and < 1.0.0"
+
+[dev_dependencies]
+gleeunit = ">= 1.0.0 and < 2.0.0"
