@@ -1,6 +1,10 @@
+import gleam/dict
+import gleam/dynamic.{type Dynamic}
+import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/result
+import gleam/string
 import gleeunit
 
 import error
@@ -21,13 +25,7 @@ const default_timeout = 1000
 
 /// 在一个作用域里跑断言，回调返回 Nil；作用域本身失败则测试失败
 fn with(value: a, run: fn(var.Var(a)) -> Nil) -> Nil {
-  let assert Ok(Nil) = var.scope(value, default_timeout, run)
-  Nil
-}
-
-/// 同上，但自定义超时上限
-fn with_timeout(value: a, ms: Int, run: fn(var.Var(a)) -> Nil) -> Nil {
-  let assert Ok(Nil) = var.scope(value, ms, run)
+  let assert Ok(Nil) = var.scope(value, run)
   Nil
 }
 
@@ -49,25 +47,68 @@ fn occupy(value: var.Var(a), ms: Int) -> Nil {
   process.receive_forever(busy)
 }
 
+// shine_try 现在只交出原始数据（class / reason / stacktrace），
+// 所以下面两个 helper 就是"使用者拿到之后要自己做的事"。
+
+/// reason 是 atom 键的 Erlang map，Gleam 里写不出 atom 键，
+/// 所以整体解出来后再用 string.inspect 出来的名字比对
+fn entries(reason: Dynamic) -> List(#(String, Dynamic)) {
+  case decode.run(reason, decode.dict(decode.dynamic, decode.dynamic)) {
+    Error(_) -> []
+    Ok(dict) ->
+      dict
+      |> dict.to_list
+      |> list.map(fn(kv) { #(string.inspect(kv.0), kv.1) })
+  }
+}
+
+/// 取 reason 里某个字段的字符串值（取不到返回空串）
+fn reason_field(reason: Dynamic, name: String) -> String {
+  entries(reason)
+  |> list.find_map(fn(kv) {
+    case kv.0 == name {
+      True ->
+        case decode.run(kv.1, decode.string) {
+          Ok(text) -> Ok(text)
+          Error(_) -> Error(Nil)
+        }
+      False -> Error(Nil)
+    }
+  })
+  |> result.unwrap("")
+}
+
+/// class 是原始的 Erlang atom：error / exit / throw
+fn class_name(class: Dynamic) -> String {
+  string.inspect(class)
+}
+
+// 测试里需要主动抛出另外两类异常
+@external(erlang, "erlang", "throw")
+fn throw(value: a) -> b
+
+@external(erlang, "erlang", "exit")
+fn exit(reason: a) -> b
+
 // ─────────────────────────── 获取 ───────────────────────────
 
 pub fn get_initial_test() {
   with(5, fn(v) {
-    assert var.get(v) == 5
+    assert var.get(v, default_timeout) == 5
   })
 }
 
 pub fn get_repeated_test() {
   with(5, fn(v) {
-    assert var.get(v) == 5
-    assert var.get(v) == 5
-    assert var.get(v) == 5
+    assert var.get(v, default_timeout) == 5
+    assert var.get(v, default_timeout) == 5
+    assert var.get(v, default_timeout) == 5
   })
 }
 
 pub fn try_get_ok_test() {
   with(7, fn(v) {
-    assert var.try_get(v) == Ok(7)
+    assert var.try_get(v, default_timeout) == Ok(7)
   })
 }
 
@@ -75,31 +116,31 @@ pub fn try_get_ok_test() {
 
 pub fn set_returns_new_value_test() {
   with(5, fn(v) {
-    assert var.set(v, 10) == 10
+    assert var.set(v, default_timeout, 10) == 10
   })
 }
 
 pub fn set_then_get_test() {
   with(5, fn(v) {
-    assert var.get(v) == 5
-    assert var.set(v, 10) == 10
-    assert var.get(v) == 10
+    assert var.get(v, default_timeout) == 5
+    assert var.set(v, default_timeout, 10) == 10
+    assert var.get(v, default_timeout) == 10
   })
 }
 
 pub fn set_many_test() {
   with(0, fn(v) {
-    assert var.set(v, 1) == 1
-    assert var.set(v, 2) == 2
-    assert var.set(v, 3) == 3
-    assert var.get(v) == 3
+    assert var.set(v, default_timeout, 1) == 1
+    assert var.set(v, default_timeout, 2) == 2
+    assert var.set(v, default_timeout, 3) == 3
+    assert var.get(v, default_timeout) == 3
   })
 }
 
 pub fn try_set_ok_test() {
   with(0, fn(v) {
-    assert var.try_set(v, 9) == Ok(9)
-    assert var.get(v) == 9
+    assert var.try_set(v, default_timeout, 9) == Ok(9)
+    assert var.get(v, default_timeout) == 9
   })
 }
 
@@ -114,7 +155,7 @@ pub fn update_returns_new_value_test() {
 pub fn update_then_get_test() {
   with(5, fn(v) {
     assert var.update(v, fn(x) { x * 2 }) == Ok(10)
-    assert var.get(v) == 10
+    assert var.get(v, default_timeout) == 10
   })
 }
 
@@ -123,28 +164,27 @@ pub fn update_chain_test() {
     assert var.update(v, fn(x) { x + 1 }) == Ok(1)
     assert var.update(v, fn(x) { x * 10 }) == Ok(10)
     assert var.update(v, fn(x) { x - 3 }) == Ok(7)
-    assert var.get(v) == 7
+    assert var.get(v, default_timeout) == 7
   })
 }
 
 /// 回调 panic：返回 Error，且值不变
 pub fn update_panic_keeps_value_test() {
   with(5, fn(v) {
-    let assert Error(var.CallbackError(_)) = var.update(v, fn(_) { panic })
-    assert var.get(v) == 5
+    let assert Error(var.UpdateErr(_)) = var.update(v, fn(_) { panic })
+    assert var.get(v, default_timeout) == 5
   })
 }
 
-/// 回调 panic：错误里带着 shine_try 解析出来的异常信息
+/// 回调 panic：错误里带着 shine_try 交出来的原始信息
 pub fn update_error_payload_test() {
   with(5, fn(v) {
-    let assert Error(var.CallbackError(e)) =
-      var.update(v, fn(_) { panic as "故意失败" })
+    let assert Error(var.UpdateErr(e)) = var.update(v, fn(_) { panic as "故意失败" })
 
-    assert e.is_gleam_error == True
-    assert e.message == Some("故意失败")
-    assert e.class == error.ErrorClass
-    assert var.get(v) == 5
+    assert class_name(e.class) == "Error"
+    assert reason_field(e.reason, "Message") == "故意失败"
+    assert reason_field(e.reason, "File") == "test/var_test.gleam"
+    assert var.get(v, default_timeout) == 5
   })
 }
 
@@ -152,27 +192,27 @@ pub fn update_error_payload_test() {
 
 pub fn string_value_test() {
   with("hello", fn(v) {
-    assert var.get(v) == "hello"
-    assert var.set(v, "world") == "world"
+    assert var.get(v, default_timeout) == "hello"
+    assert var.set(v, default_timeout, "world") == "world"
     assert var.update(v, fn(s) { s <> "!" }) == Ok("world!")
-    assert var.get(v) == "world!"
+    assert var.get(v, default_timeout) == "world!"
   })
 }
 
 pub fn list_value_test() {
   with([1, 2, 3], fn(v) {
     assert var.update(v, fn(l) { list.append(l, [4]) }) == Ok([1, 2, 3, 4])
-    assert var.get(v) == [1, 2, 3, 4]
+    assert var.get(v, default_timeout) == [1, 2, 3, 4]
   })
 }
 
 pub fn custom_type_value_test() {
   with(Point(1, 2), fn(v) {
-    assert var.get(v) == Point(1, 2)
+    assert var.get(v, default_timeout) == Point(1, 2)
     assert var.update(v, fn(p) { Point(x: p.x + 1, y: p.y + 1) })
       == Ok(Point(2, 3))
-    assert var.set(v, Point(9, 9)) == Point(9, 9)
-    assert var.get(v) == Point(9, 9)
+    assert var.set(v, default_timeout, Point(9, 9)) == Point(9, 9)
+    assert var.get(v, default_timeout) == Point(9, 9)
   })
 }
 
@@ -180,96 +220,92 @@ pub fn custom_type_value_test() {
 
 /// 回调的返回值会被 scope 带出来
 pub fn scope_returns_callback_value_test() {
-  let assert Ok(42) = var.scope(5, default_timeout, fn(v) { var.get(v) + 37 })
+  let assert Ok(42) = var.scope(5, fn(v) { var.get(v, default_timeout) + 37 })
   Nil
 }
 
-/// 回调 panic：返回 CallbackErr，并带着异常信息
+/// 回调 panic：返回 ScopeErr，并带着原始异常信息
 pub fn scope_callback_panic_test() {
-  let result = var.scope(5, default_timeout, fn(_) { panic as "炸了" })
+  let result = var.scope(5, fn(_) { panic as "炸了" })
 
-  let assert Error(var.CallbackErr(e)) = result
-  assert e.is_gleam_error == True
-  assert e.message == Some("炸了")
-  assert e.file != None
-  assert e.line != None
+  let assert Error(var.ScopeErr(e)) = result
+  assert class_name(e.class) == "Error"
+  assert reason_field(e.reason, "Message") == "炸了"
 }
 
-/// 回调 throw：shine_try 捕获三类异常，同样返回 CallbackErr
+/// 回调 throw：class 是 throw
 pub fn scope_callback_throw_test() {
-  let result = var.scope(5, default_timeout, fn(_) { throw("boom") })
-  let assert Error(var.CallbackErr(e)) = result
-  assert e.class == error.ThrowClass
+  let result = var.scope(5, fn(_) { throw("boom") })
+  let assert Error(var.ScopeErr(e)) = result
+  assert class_name(e.class) == "Throw"
 }
 
-/// 回调 exit：同样被捕获
+/// 回调 exit：class 是 exit
 pub fn scope_callback_exit_test() {
-  let result = var.scope(5, default_timeout, fn(_) { exit("bye") })
-  let assert Error(var.CallbackErr(e)) = result
-  assert e.class == error.ExitClass
+  let result = var.scope(5, fn(_) { exit("bye") })
+  let assert Error(var.ScopeErr(e)) = result
+  assert class_name(e.class) == "Exit"
 }
 
 /// 嵌套作用域互不影响
 pub fn nested_scope_test() {
   with(1, fn(outer) {
-    assert var.set(outer, 2) == 2
+    assert var.set(outer, default_timeout, 2) == 2
 
     with(10, fn(inner) {
-      assert var.set(inner, 20) == 20
-      assert var.get(inner) == 20
+      assert var.set(inner, default_timeout, 20) == 20
+      assert var.get(inner, default_timeout) == 20
     })
 
     // 内层销毁后，外层仍然可用且值不变
-    assert var.get(outer) == 2
+    assert var.get(outer, default_timeout) == 2
   })
 }
 
 // ─────────────────────────── 超时 ───────────────────────────
 
 pub fn try_get_timeout_test() {
-  with_timeout(5, 50, fn(v) {
+  with(5, fn(v) {
     occupy(v, 300)
-    assert var.try_get(v) == Error(var.Timeout)
+    assert var.try_get(v, 50) == Error(var.Timeout)
   })
 }
 
 pub fn try_set_timeout_test() {
-  with_timeout(5, 50, fn(v) {
+  with(5, fn(v) {
     occupy(v, 300)
-    assert var.try_set(v, 10) == Error(var.Timeout)
+    assert var.try_set(v, 50, 10) == Error(var.Timeout)
   })
 }
 
 /// get 超时是 panic，不是返回 Result
 pub fn get_timeout_panics_test() {
-  with_timeout(5, 50, fn(v) {
+  with(5, fn(v) {
     occupy(v, 300)
-    let assert Error(_) = error.try(fn() { var.get(v) })
+    let assert Error(_) = error.try(fn() { var.get(v, 50) })
     Nil
   })
 }
 
 /// set 超时同样是 panic
 pub fn set_timeout_panics_test() {
-  with_timeout(5, 50, fn(v) {
+  with(5, fn(v) {
     occupy(v, 300)
-    let assert Error(_) = error.try(fn() { var.set(v, 10) })
+    let assert Error(_) = error.try(fn() { var.set(v, 50, 10) })
     Nil
   })
 }
 
 // ─────────────────── 永久等待的读写（*_forever） ───────────────────
 
-/// get_forever 不受 time_out 限制：time_out = 0 时 get 会超时，它依然能拿到值
-pub fn get_forever_ignores_timeout_test() {
-  with_timeout(5, 0, fn(v) {
+pub fn get_forever_test() {
+  with(5, fn(v) {
     assert var.get_forever(v) == 5
   })
 }
 
-/// set_forever 同理
-pub fn set_forever_ignores_timeout_test() {
-  with_timeout(5, 0, fn(v) {
+pub fn set_forever_test() {
+  with(5, fn(v) {
     assert var.set_forever(v, 99) == 99
     assert var.get_forever(v) == 99
   })
@@ -277,17 +313,18 @@ pub fn set_forever_ignores_timeout_test() {
 
 /// 值进程忙时 get 会超时，get_forever 会一直等到它空闲
 pub fn get_forever_waits_test() {
-  with_timeout(5, 50, fn(v) {
+  with(5, fn(v) {
     occupy(v, 200)
-    assert var.try_get(v) == Error(var.Timeout)
+    assert var.try_get(v, 50) == Error(var.Timeout)
     assert var.get_forever(v) == 5
   })
 }
 
-/// 值进程忙时 set_forever 会等到它空闲再设置
+/// 值进程忙时 set 会超时，set_forever 会等到它空闲再设置
 pub fn set_forever_waits_test() {
-  with_timeout(5, 50, fn(v) {
+  with(5, fn(v) {
     occupy(v, 200)
+    assert var.try_set(v, 50, 99) == Error(var.Timeout)
     assert var.set_forever(v, 99) == 99
     assert var.get_forever(v) == 99
   })
@@ -302,7 +339,7 @@ pub fn set_forever_waits_test() {
 fn escaped_var() -> var.Var(Int) {
   let box = process.new_subject()
   let assert Ok(Nil) =
-    var.scope(5, default_timeout, fn(v) {
+    var.scope(5, fn(v) {
       process.send(box, v)
       Nil
     })
@@ -314,7 +351,7 @@ fn dead_var() -> var.Var(Int) {
   let escaped = escaped_var()
   // kill 与这次 get 同源，顺序有保证；get 会因为进程已退出而 panic，
   // panic 回来时进程一定已经死了
-  let assert Error(_) = error.try(fn() { var.get(escaped) })
+  let assert Error(_) = error.try(fn() { var.get(escaped, default_timeout) })
   escaped
 }
 
@@ -335,7 +372,7 @@ pub fn is_alive_false_after_scope_test() {
 pub fn is_alive_stays_false_test() {
   let escaped = dead_var()
   assert var.is_alive(escaped) == False
-  let _ = var.try_get(escaped)
+  let _ = var.try_get(escaped, default_timeout)
   assert var.is_alive(escaped) == False
 }
 
@@ -344,14 +381,14 @@ pub fn escaped_value_get_panics_test() {
   let escaped = escaped_var()
 
   // kill 与这次 get 都由本进程发出，消息顺序有保证
-  let assert Error(_) = error.try(fn() { var.get(escaped) })
+  let assert Error(_) = error.try(fn() { var.get(escaped, default_timeout) })
   Nil
 }
 
 /// 当前行为：值已死亡时 try_get 返回 Error(Timeout)（而不是别的错误）
 pub fn escaped_value_try_get_is_timeout_test() {
   let escaped = dead_var()
-  assert var.try_get(escaped) == Error(var.Timeout)
+  assert var.try_get(escaped, default_timeout) == Error(var.Timeout)
 }
 
 /// 当前行为：值已死亡时 update 会让调用方 panic，而不是返回 Error
@@ -391,7 +428,7 @@ pub fn concurrent_update_test() {
     list.repeat(Nil, workers)
     |> list.each(fn(_) { process.receive_forever(done) })
 
-    assert var.get(v) == workers
+    assert var.get(v, default_timeout) == workers
   })
 }
 
@@ -399,10 +436,13 @@ pub fn concurrent_update_test() {
 pub fn cross_process_set_test() {
   with(0, fn(v) {
     let done = process.new_subject()
-    let _ = process.spawn_unlinked(fn() { process.send(done, var.set(v, 7)) })
+    let _ =
+      process.spawn_unlinked(fn() {
+        process.send(done, var.set(v, default_timeout, 7))
+      })
 
     assert process.receive_forever(done) == 7
-    assert var.get(v) == 7
+    assert var.get(v, default_timeout) == 7
   })
 }
 
@@ -410,15 +450,11 @@ pub fn cross_process_set_test() {
 pub fn cross_process_get_test() {
   with(99, fn(v) {
     let done = process.new_subject()
-    let _ = process.spawn_unlinked(fn() { process.send(done, var.get(v)) })
+    let _ =
+      process.spawn_unlinked(fn() {
+        process.send(done, var.get(v, default_timeout))
+      })
 
     assert process.receive_forever(done) == 99
   })
 }
-
-// 测试里需要主动抛出另外两类异常
-@external(erlang, "erlang", "throw")
-fn throw(value: a) -> b
-
-@external(erlang, "erlang", "exit")
-fn exit(reason: a) -> b
