@@ -38,6 +38,28 @@ pub fn main() -> Result(Nil, var.ScopeError) {
 }
 ```
 
+## subscribe
+```gleam
+use val <- var.scope(10)
+
+assert var.get(val, 1000) == 10
+
+// 订阅函数并获取用于取消订阅的函数
+let unsubscribe =
+  var.subscribe(val, fn(old, new) {
+    io.println(int.to_string(old) <> " -> " <> int.to_string(new))
+  })
+
+// 设置新值，订阅函数收到 旧值10 和 新值4
+assert var.set(val, 1000, 4) == 4
+
+// 取消订阅
+unsubscribe()
+
+// 设置新值，没有订阅函数收到消息
+assert var.set(val, 1000, 5) == 5
+```
+
 ## Error
 
 ```gleam
@@ -65,7 +87,7 @@ case var.update(val, fn(n) { n + 1 }) {
 
 ## `Var` escape
 
-`scope`的回调结束时会自动终止进程。如果`Var`被传到了回调外面，之后再用它会 panic，可以用`is_alive`函数做防御性检查：
+`scope`回调结束时会自动终止进程。如果`Var`被传到了回调外面，之后再用它会 panic，可以用`is_alive`函数做防御性检查：
 
 ```gleam
 case var.is_alive(val) {

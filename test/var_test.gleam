@@ -368,6 +368,39 @@ pub fn is_alive_false_after_scope_test() {
   assert var.is_alive(escaped) == False
 }
 
+/// 让作用域回调以给定方式异常结束，并断言值进程仍然被关闭
+///
+/// scope 内部的 defer 就是「无论回调怎么结束都关闭进程」这条保证。
+/// 只测错误类型的话，很容易漏掉「进程没被关闭」这种情况。
+fn assert_closed_after_error(run: fn(var.Var(Int)) -> Nil) -> Nil {
+  let escaped = process.new_subject()
+  let assert Error(var.ScopeErr(_)) =
+    var.scope(5, fn(v) {
+      process.send(escaped, v)
+      run(v)
+    })
+
+  let assert Ok(v) = process.receive(escaped, default_timeout)
+  // kill 与这次 get 同源，顺序有保证；进程已退出时 get 会 panic
+  let assert Error(_) = error.try(fn() { var.get(v, default_timeout) })
+  assert var.is_alive(v) == False
+}
+
+/// 回调 panic 时值进程同样被关闭
+pub fn is_alive_false_after_callback_panic_test() {
+  assert_closed_after_error(fn(_) { panic as "炸了" })
+}
+
+/// 回调 throw 时值进程同样被关闭
+pub fn is_alive_false_after_callback_throw_test() {
+  assert_closed_after_error(fn(_) { throw("boom") })
+}
+
+/// 回调 exit 时值进程同样被关闭
+pub fn is_alive_false_after_callback_exit_test() {
+  assert_closed_after_error(fn(_) { exit("bye") })
+}
+
 /// 已死亡的值，反复查询结果稳定
 pub fn is_alive_stays_false_test() {
   let escaped = dead_var()
