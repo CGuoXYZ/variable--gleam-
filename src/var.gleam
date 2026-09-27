@@ -99,8 +99,8 @@ pub fn scope(
       Ok(var) -> {
         // 尝试执行回调函数
         //
-        // 成功返回回调的返回值
-        // 失败返回回调的异常
+        // 成功返回函数的返回值
+        // 失败返回函数的异常
         use ex <- result.try_recover({
           // 尝试执行回调，随后关闭可变值进程
           use <- error.defer(fn() { closure(var) })
@@ -115,18 +115,33 @@ pub fn scope(
 
 /// 订阅函数，每当成功[set](https://variable.hexdocs.pm/var.html#set)/[update](https://variable.hexdocs.pm/var.html#update)时自动调用订阅函数
 /// 
-/// 订阅函数发生异常不会有后果
+/// 订阅函数发生异常一般不会有后果
 /// 
 /// 该函数会为每个订阅spawn一个进程，如果订阅函数执行的较慢则会导致消息堆积
 /// 
+/// # Notice
+/// 订阅函数只接收订阅后的值，不补发当前值
+/// 
+/// 在订阅函数中[set](https://variable.hexdocs.pm/var.html#set)/[update](https://variable.hexdocs.pm/var.html#update)同一个[Var](https://variable.hexdocs.pm/var.html#Var)会导致循环
+/// ```gleam
+/// use val <- var.scope(5)
+/// 
+/// var.subscribe(val, fn(old, new) {
+///   io.println(int.to_string(old) <> " -> " <> int.to_string(new))
+///   var.set(val, 1000, new + 1)
+/// })
+/// 
+/// var.set(val, 1000, 6)
+/// ```
+/// 
 /// # Param 
-/// f: 接收旧值和新值的订阅函数(**f(old_val, new_val)**)
+/// subscribe: 接收旧值和新值的订阅函数(**subscribe(old_val, new_val)**)
 /// 
 /// # Return
 /// 返回一个用于取消订阅的函数
 pub fn subscribe(
   var: Var(var),
-  f: fn(var, var) -> discard,
+  subscribe: fn(var, var) -> discard,
 ) -> fn() -> Unsubscribed {
   // 用于接收订阅进程的通道
   let ready = process.new_subject()
@@ -146,7 +161,7 @@ pub fn subscribe(
     // 发送订阅进程的通道
     process.send(ready, sub)
 
-    subscribe_pkg(sel, f)
+    subscribe_encap(sel, subscribe)
   })
 
   // 唯一键
@@ -217,6 +232,9 @@ pub fn try_set(
 /// 该函数没有超时保护，会一直等待直至回调函数返回或异常
 /// 
 /// 如果回调函数卡住则会造成阻塞，导致其他操作超时
+/// 
+/// # Panic
+/// 可变值进程关闭后使用该函数会导致异常
 pub fn update(
   var: Var(var),
   update: fn(var) -> var,
@@ -229,13 +247,13 @@ pub fn update(
 /// 该函数主要用在可变值疑似出逃的情景，使用前可以进行检查
 /// 
 /// # Notice
-/// 不要过度相信这个结果，因为值可能前脚还存活后脚就被销毁了
+/// 不要过度相信这个结果，因为可变值进程可能前脚还存活后脚就关闭了
 pub fn is_alive(var: Var(var)) -> Bool {
   process.is_alive(var.pid)
 }
 
 /// 关闭可变值进程
-fn closure(var: Var(var)) {
+fn closure(var: Var(var)) -> Nil {
   process.send(var.sub, ValClosure)
 }
 
@@ -252,18 +270,22 @@ fn new(val: var) -> Result(Started(Subject(ValMSG(var))), StartError) {
   |> actor.start()
 }
 
-/// 包装订阅函数
-fn subscribe_pkg(
+/// 封装订阅函数
+fn subscribe_encap(
   sel: Selector(SubMSG(var)),
-  f: fn(var, var) -> discard,
+  subscribe: fn(var, var) -> discard,
 ) -> Nil {
   case process.selector_receive_forever(sel) {
     // 关闭消息或可变值进程关闭消息
     SubClosure | ValClosed -> Nil
     // 值变化消息
     ValChange(old_val:, new_val:) -> {
-      error.try(fn() { f(old_val, new_val) }) |> discard()
-      subscribe_pkg(sel, f)
+      // 执行订阅函数
+      error.try(fn() { subscribe(old_val, new_val) })
+      |> discard()
+
+      // 递归调用，继续接收消息
+      subscribe_encap(sel, subscribe)
     }
   }
 }
@@ -273,21 +295,13 @@ fn notify(
   subscribe: Dict(Reference, Subject(SubMSG(var))),
   old_val: var,
   new_val: var,
-) {
+) -> Nil {
   use _, sub <- dict.each(subscribe)
   process.send(sub, ValChange(old_val:, new_val:))
 }
 
-/// 用不到的值需要用 let _ = ... 消除警告
-/// 
-/// 可用这个函数替代
-fn discard(_) {
-  Nil
-}
-
 fn handle(val: Val(var), msg: ValMSG(var)) -> Next(Val(var), ValMSG(var)) {
   let Val(val:, subscribe:) = val
-
   case msg {
     // 关闭
     ValClosure -> actor.stop()
@@ -297,45 +311,55 @@ fn handle(val: Val(var), msg: ValMSG(var)) -> Next(Val(var), ValMSG(var)) {
       |> actor.continue()
     // 取消订阅
     Unsubscribe(ref:) -> {
-      result.try(dict.get(subscribe, ref), fn(sub) {
+      // 从字典中删除该订阅并通知其关闭
+      discard({
+        use sub <- result.try(dict.get(subscribe, ref))
         process.send(sub, SubClosure) |> Ok()
       })
-      |> discard()
 
       Val(val:, subscribe: dict.delete(subscribe, ref))
       |> actor.continue()
     }
     // 获取值
     Get(sub:) -> {
-      // 发送当前值
       process.send(sub, val)
-      actor.continue(Val(val:, subscribe:))
+
+      Val(val:, subscribe:)
+      |> actor.continue()
     }
     // 设置值
     Set(new_val:, sub:) -> {
-      // 发送新值
       process.send(sub, new_val)
-      // 通知订阅函数值已发生变化
       notify(subscribe, val, new_val)
-      actor.continue(Val(val: new_val, subscribe:))
+
+      Val(val: new_val, subscribe:)
+      |> actor.continue()
     }
     // 使用给定函数更新值
     Update(update:, sub:) ->
       case error.try(fn() { update(val) }) {
-        // 函数正常
-        Ok(new_val) -> {
-          // 发送新值
-          process.send(sub, Ok(new_val))
-          // 通知订阅函数值已发生变化
-          notify(subscribe, val, new_val)
-          actor.continue(Val(val: new_val, subscribe:))
-        }
         // 函数异常
         Error(err) -> {
-          // 发送回调异常
           process.send(sub, Error(UpdateErr(err)))
-          actor.continue(Val(val:, subscribe:))
+
+          Val(val:, subscribe:)
+          |> actor.continue()
+        }
+        // 函数正常
+        Ok(new_val) -> {
+          process.send(sub, Ok(new_val))
+          notify(subscribe, val, new_val)
+
+          Val(val: new_val, subscribe:)
+          |> actor.continue()
         }
       }
   }
+}
+
+/// 用不到的值需要用 let _ = ... 消除警告
+/// 
+/// 可用这个函数替代
+fn discard(_) -> Nil {
+  Nil
 }
