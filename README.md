@@ -43,8 +43,6 @@ pub fn main() -> Result(Nil, var.ScopeError) {
 ```gleam
 use val <- var.scope(10)
 
-assert var.get(val, 1000) == 10
-
 // 订阅函数并获取用于取消订阅的函数
 let unsubscribe =
   var.subscribe(val, fn(old, new) {
@@ -52,13 +50,13 @@ let unsubscribe =
   })
 
 // 设置新值，订阅函数收到 旧值10 和 新值4
-assert var.set(val, 1000, 4) == 4
+var.set(val, 1000, 4)
 
 // 取消订阅
 unsubscribe()
 
 // 设置新值，没有订阅函数收到消息
-assert var.set(val, 1000, 5) == 5
+var.set(val, 1000, 5)
 ```
 在订阅函数中`set`/`update`同一个`Var`会导致循环
 ```gleam

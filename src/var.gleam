@@ -79,6 +79,16 @@ type SubMSG(var) {
 /// 如果回调函数已经结束，但仍有进程在持有可变值则有引发异常的风险
 /// 
 /// 对于可变值出逃后的行为不作保障
+/// ```gleam
+/// let sub = process.new_subject()
+/// // 将Var传到回调外部
+/// // 随后回调结束，进程关闭
+/// var.scope(5, fn(val) { process.send(sub, val) })
+/// let val = process.receive_forever(sub)
+///
+/// // 进程已关闭，这里会产生异常
+/// var.get(val, 1000)
+/// ```
 /// 
 /// # Param
 /// val：初始值
@@ -183,11 +193,17 @@ pub fn subscribe(
 /// 操作可能超时，可以使用[try_get](https://variable.hexdocs.pm/var.html#try_get)
 /// 
 /// 如果想一直等待可以使用[get_forever](https://variable.hexdocs.pm/var.html#get_forever)
+/// 
+/// # Panic
+/// 可变值进程关闭后使用该函数会导致异常
 pub fn get(var: Var(var), timeout: Int) -> var {
   process.call(var.sub, timeout, Get)
 }
 
 /// 获取值并一直等待直至成功
+/// 
+/// # Panic
+/// 可变值进程关闭后使用该函数会导致异常
 pub fn get_forever(var: Var(var)) -> var {
   process.call_forever(var.sub, Get)
 }
@@ -204,11 +220,17 @@ pub fn try_get(var: Var(var), timeout: Int) -> Result(var, Timeout) {
 /// 操作可能超时，可以使用[try_set](https://variable.hexdocs.pm/var.html#try_set)
 /// 
 /// 如果想一直等待可以使用[set_forever](https://variable.hexdocs.pm/var.html#set_forever)
+/// 
+/// # Panic
+/// 可变值进程关闭后使用该函数会导致异常
 pub fn set(var: Var(var), timeout: Int, new_val: var) -> var {
   process.call(var.sub, timeout, Set(new_val:, sub: _))
 }
 
 /// 设置值并一直等待直至成功，随后返回新的值
+/// 
+/// # Panic
+/// 可变值进程关闭后使用该函数会导致异常
 pub fn set_forever(var: Var(var), new_val: var) -> var {
   process.call_forever(var.sub, Set(new_val:, sub: _))
 }
