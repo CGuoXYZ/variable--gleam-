@@ -42,7 +42,7 @@ type Val(var) {
   /// val: 值本身
   /// 
   /// subscribe: 携带订阅进程通道的字典
-  Val(val: var, subscribe: Dict(Reference, Subject(SubMSG(var))))
+  Val(val: var, subscribes: Dict(Reference, Subject(SubMSG(var))))
 }
 
 /// 可变值进程接收的消息
@@ -98,29 +98,24 @@ pub fn scope(
   val: var,
   scope: fn(Var(var)) -> return,
 ) -> Result(return, ScopeError) {
-  // 初始化可变值
-  init(val)
-  // 包装传入的函数
-  |> fn(var: Result(Var(var), StartError)) -> Result(return, ScopeError) {
-    case var {
-      // 启动失败
-      Error(err) -> Error(StartErr(err))
-      // 启动成功
-      Ok(var) -> {
-        // 尝试执行回调函数
-        //
-        // 成功返回函数的返回值
-        // 失败返回函数的异常
-        use ex <- result.try_recover({
-          // 尝试执行回调，随后关闭可变值进程
-          use <- error.defer(fn() { closure(var) })
-          use <- error.try()
-          scope(var)
-        })
-        Error(ScopeErr(ex))
-      }
+  case init(val) {
+    // 启动失败
+    Error(err) -> Error(StartErr(err))
+    // 启动成功
+    Ok(var) -> {
+      // 尝试执行回调函数
+      //
+      // 成功返回函数的返回值
+      // 失败返回函数的异常
+      use ex <- result.try_recover({
+        // 尝试执行回调，随后关闭可变值进程
+        use <- error.defer(fn() { closure(var) })
+        use <- error.try()
+        scope(var)
+      })
+      Error(ScopeErr(ex))
     }
-  }()
+  }
 }
 
 /// 订阅函数，每当成功[set](https://variable.hexdocs.pm/var.html#set)/[update](https://variable.hexdocs.pm/var.html#update)时自动调用订阅函数
@@ -287,7 +282,7 @@ fn init(val: var) -> Result(Var(var), StartError) {
 
 /// 创建新的可变值进程
 fn new(val: var) -> Result(Started(Subject(ValMSG(var))), StartError) {
-  actor.new(Val(val:, subscribe: dict.new()))
+  actor.new(Val(val:, subscribes: dict.new()))
   |> actor.on_message(handle)
   |> actor.start()
 }
@@ -323,38 +318,38 @@ fn notify(
 }
 
 fn handle(val: Val(var), msg: ValMSG(var)) -> Next(Val(var), ValMSG(var)) {
-  let Val(val:, subscribe:) = val
+  let Val(val:, subscribes:) = val
   case msg {
     // 关闭
     ValClosure -> actor.stop()
     // 订阅
     Subscribe(ref:, sub:) ->
-      Val(val:, subscribe: dict.insert(subscribe, ref, sub))
+      Val(val:, subscribes: dict.insert(subscribes, ref, sub))
       |> actor.continue()
     // 取消订阅
     Unsubscribe(ref:) -> {
       // 从字典中删除该订阅并通知其关闭
       discard({
-        use sub <- result.try(dict.get(subscribe, ref))
+        use sub <- result.try(dict.get(subscribes, ref))
         process.send(sub, SubClosure) |> Ok()
       })
 
-      Val(val:, subscribe: dict.delete(subscribe, ref))
+      Val(val:, subscribes: dict.delete(subscribes, ref))
       |> actor.continue()
     }
     // 获取值
     Get(sub:) -> {
       process.send(sub, val)
 
-      Val(val:, subscribe:)
+      Val(val:, subscribes:)
       |> actor.continue()
     }
     // 设置值
     Set(new_val:, sub:) -> {
       process.send(sub, new_val)
-      notify(subscribe, val, new_val)
+      notify(subscribes, val, new_val)
 
-      Val(val: new_val, subscribe:)
+      Val(val: new_val, subscribes:)
       |> actor.continue()
     }
     // 使用给定函数更新值
@@ -364,15 +359,15 @@ fn handle(val: Val(var), msg: ValMSG(var)) -> Next(Val(var), ValMSG(var)) {
         Error(err) -> {
           process.send(sub, Error(UpdateErr(err)))
 
-          Val(val:, subscribe:)
+          Val(val:, subscribes:)
           |> actor.continue()
         }
         // 函数正常
         Ok(new_val) -> {
           process.send(sub, Ok(new_val))
-          notify(subscribe, val, new_val)
+          notify(subscribes, val, new_val)
 
-          Val(val: new_val, subscribe:)
+          Val(val: new_val, subscribes:)
           |> actor.continue()
         }
       }
