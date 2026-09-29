@@ -581,3 +581,39 @@ pub fn callback_can_set_same_var_test() {
     assert var.try_get(v, default_timeout) == Ok(2)
   })
 }
+
+// ─────────────── 期限（带单调时间的 set / get） ───────────────
+
+/// 被丢弃的 set 不应通知订阅者
+pub fn expired_set_does_not_notify_test() {
+  with(0, fn(v) {
+    let seen = process.new_subject()
+    let _ = record(v, seen)
+
+    // 期限 0：请求必然已过期
+    assert var.try_set(v, 0, 42) == Error(var.Timeout)
+    // Get 排在 Set 之后，同源保序：走到这里 Set 必然已处理完（被丢弃），
+    // 之后的负向断言才可靠
+    assert var.get_forever(v) == 0
+
+    assert_no_message(seen)
+  })
+}
+
+/// 超时的 get 不应回复
+///
+/// 值进程丢弃过期请求时连回复都不发，调用方邮箱里才不会留下一条
+/// 永远没人取的消息（否则长期轮询的进程邮箱会一直涨）。
+pub fn timed_out_get_leaves_no_message_test() {
+  with(0, fn(v) {
+    let before = mailbox_len()
+
+    assert var.try_get(v, 0) == Error(var.Timeout)
+
+    // 成功的 get 排在过期那条之后，同源保序：
+    // 它返回时，前一条请求的回复（如果有）早就该到了
+    assert var.get_forever(v) == 0
+
+    assert mailbox_len() == before
+  })
+}

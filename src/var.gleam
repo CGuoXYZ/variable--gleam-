@@ -1,10 +1,12 @@
+import error.{type Exception}
+import gleam/bool
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Pid, type Selector, type Subject}
 import gleam/erlang/reference.{type Reference}
 import gleam/otp/actor.{type Next, type StartError, type Started, Started}
 import gleam/result
 
-import error.{type Exception}
+import variable/internal/term.{type Term}
 
 /// 要与可变值交互需要持有此类型
 pub opaque type Var(var) {
@@ -54,9 +56,9 @@ type ValMSG(var) {
   /// 取消订阅
   Unsubscribe(ref: Reference)
   /// 获取值
-  Get(sub: Subject(var))
+  Get(sub: Subject(var), term: Term)
   /// 设置值
-  Set(new_val: var, sub: Subject(var))
+  Set(new_val: var, sub: Subject(var), term: Term)
   /// 使用给定函数处理值
   Update(update: fn(var) -> var, sub: Subject(Result(var, UpdateError)))
 }
@@ -73,10 +75,12 @@ type SubMSG(var) {
 
 /// 创建一个进程模拟可变值
 /// 
-/// 可变值在回调函数中可用，函数结束自动销毁
+/// 可变值在回调函数中可用，回调结束自动关闭可变值进程
+/// 
+/// 关闭是同步的，会等待所有消息处理完毕，回调函数结束后进程必然已关闭
 /// 
 /// # Notice
-/// 如果回调函数已经结束，但仍有进程在持有可变值则有引发异常的风险
+/// 如果回调已经结束，但仍有进程在持有可变值则有引发异常的风险
 /// 
 /// 对于可变值出逃后的行为不作保障
 /// ```gleam
@@ -190,17 +194,17 @@ pub fn subscribe(
 /// 如果想一直等待可以使用[get_forever](https://variable.hexdocs.pm/var.html#get_forever)
 /// 
 /// # Panic
-/// 可变值进程关闭后使用该函数会导致异常
+/// 进程关闭后使用该函数会导致异常
 pub fn get(var: Var(var), timeout: Int) -> var {
-  process.call(var.sub, timeout, Get)
+  process.call(var.sub, timeout, Get(sub: _, term: term.deadline(timeout)))
 }
 
 /// 获取值并一直等待直至成功
 /// 
 /// # Panic
-/// 可变值进程关闭后使用该函数会导致异常
+/// 进程关闭后使用该函数会导致异常
 pub fn get_forever(var: Var(var)) -> var {
-  process.call_forever(var.sub, Get)
+  process.call_forever(var.sub, Get(sub: _, term: term.forever()))
 }
 
 /// 尝试在指定时间内(毫秒)获取值
@@ -217,17 +221,21 @@ pub fn try_get(var: Var(var), timeout: Int) -> Result(var, Timeout) {
 /// 如果想一直等待可以使用[set_forever](https://variable.hexdocs.pm/var.html#set_forever)
 /// 
 /// # Panic
-/// 可变值进程关闭后使用该函数会导致异常
+/// 进程关闭后使用该函数会导致异常
 pub fn set(var: Var(var), timeout: Int, new_val: var) -> var {
-  process.call(var.sub, timeout, Set(new_val:, sub: _))
+  process.call(var.sub, timeout, Set(
+    new_val:,
+    sub: _,
+    term: term.deadline(timeout),
+  ))
 }
 
 /// 设置值并一直等待直至成功，随后返回新的值
 /// 
 /// # Panic
-/// 可变值进程关闭后使用该函数会导致异常
+/// 进程关闭后使用该函数会导致异常
 pub fn set_forever(var: Var(var), new_val: var) -> var {
-  process.call_forever(var.sub, Set(new_val:, sub: _))
+  process.call_forever(var.sub, Set(new_val:, sub: _, term: term.forever()))
 }
 
 /// 尝试在指定时间内(毫秒)设置值，随后返回新的值
@@ -250,8 +258,21 @@ pub fn try_set(
 /// 
 /// 如果回调函数卡住则会造成阻塞，导致其他操作超时
 /// 
+/// 这么做会卡死
+/// ```gleam
+/// pub fn main() {
+///   use val <- var.scope(5)
+///   var.update(val, func(val, _))
+/// }
+///
+/// fn func(val, v) {
+///   var.update(val, func(val, _))
+///   v + 1
+/// }
+/// ```
+/// 
 /// # Panic
-/// 可变值进程关闭后使用该函数会导致异常
+/// 进程关闭后使用该函数会导致异常
 pub fn update(
   var: Var(var),
   update: fn(var) -> var,
@@ -261,17 +282,24 @@ pub fn update(
 
 /// 检查可变值是否存活
 /// 
-/// 该函数主要用在可变值疑似出逃的情景，使用前可以进行检查
-/// 
 /// # Notice
-/// 不要过度相信这个结果，因为可变值进程可能前脚还存活后脚就关闭了
+/// 同进程内`scope`回调结束进程已关闭，该值必然为`False`，`scope`回调内进程未关闭，该值必然为`True`
+/// 
+/// 跨进程该值才有参考价值，但也仅供参考
 pub fn is_alive(var: Var(var)) -> Bool {
   process.is_alive(var.pid)
 }
 
-/// 关闭可变值进程
+/// 等待所有消息处理完毕，随后关闭进程
 fn closure(var: Var(var)) -> Nil {
+  let mon = process.monitor(var.pid)
+  let sel =
+    process.new_selector()
+    |> process.select_specific_monitor(mon, fn(_) { Nil })
+
   process.send(var.sub, ValClosure)
+
+  process.selector_receive_forever(sel)
 }
 
 /// 初始化新的可变值
@@ -317,8 +345,8 @@ fn notify(
   process.send(sub, ValChange(old_val:, new_val:))
 }
 
-fn handle(val: Val(var), msg: ValMSG(var)) -> Next(Val(var), ValMSG(var)) {
-  let Val(val:, subscribes:) = val
+fn handle(value: Val(var), msg: ValMSG(var)) -> Next(Val(var), ValMSG(var)) {
+  let Val(val:, subscribes:) = value
   case msg {
     // 关闭
     ValClosure -> actor.stop()
@@ -338,14 +366,17 @@ fn handle(val: Val(var), msg: ValMSG(var)) -> Next(Val(var), ValMSG(var)) {
       |> actor.continue()
     }
     // 获取值
-    Get(sub:) -> {
+    Get(sub:, term:) -> {
+      use <- bool.guard(term.is_expired(term), actor.continue(value))
+
       process.send(sub, val)
 
-      Val(val:, subscribes:)
-      |> actor.continue()
+      actor.continue(value)
     }
     // 设置值
-    Set(new_val:, sub:) -> {
+    Set(new_val:, sub:, term:) -> {
+      use <- bool.guard(term.is_expired(term), actor.continue(value))
+
       process.send(sub, new_val)
       notify(subscribes, val, new_val)
 
@@ -359,8 +390,7 @@ fn handle(val: Val(var), msg: ValMSG(var)) -> Next(Val(var), ValMSG(var)) {
         Error(err) -> {
           process.send(sub, Error(UpdateErr(err)))
 
-          Val(val:, subscribes:)
-          |> actor.continue()
+          actor.continue(value)
         }
         // 函数正常
         Ok(new_val) -> {

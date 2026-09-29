@@ -9,6 +9,7 @@ import gleeunit
 
 import error
 import var
+import variable/internal/term
 
 pub fn main() -> Nil {
   gleeunit.main()
@@ -296,6 +297,47 @@ pub fn set_timeout_panics_test() {
   })
 }
 
+// ─────────────── 期限（带单调时间的 set / get） ───────────────
+//
+// 请求会带一个单调时间的期限：值进程处理时若已过期就直接丢弃
+// （不执行、也不回复）。下面几条钉住「丢弃」本身——去掉 var.gleam 里
+// handle 的 bool.guard(term.is_expired(term), ...) 它们就会失败。
+// 永久请求（*_forever）用 term.forever()，永不过期。
+
+/// 期限为 0 的 set 必然已过期：值必须保持不变
+pub fn zero_timeout_set_does_not_apply_test() {
+  with(9, fn(v) {
+    // deadline(0) 读取时必然已到期 → 请求必被丢弃且不回复，
+    // 所以这个 Error(Timeout) 是确定性的，与调度快慢无关
+    assert var.try_set(v, 0, 10) == Error(var.Timeout)
+    // Get 排在 Set 之后，同源保序：走到这里 Set 必然已处理完（被丢弃）
+    assert var.get_forever(v) == 9
+  })
+}
+
+/// 值进程忙得超过期限：超时的 set 不应生效
+pub fn timed_out_set_does_not_apply_test() {
+  with(0, fn(v) {
+    // 让值进程忙 300ms，随后的 20ms 期限必然过期
+    occupy(v, 300)
+    assert var.try_set(v, 20, 42) == Error(var.Timeout)
+    // 同上，Get 排在 Set 之后
+    assert var.get_forever(v) == 0
+  })
+}
+
+/// 期限覆盖得住等待时间：请求必须正常执行
+///
+/// 这条是「过度丢弃」的对照——哪天期限逻辑变成一律丢弃，它会立刻失败。
+pub fn set_within_deadline_applies_test() {
+  with(0, fn(v) {
+    occupy(v, 300)
+    // 期限 1000ms > 忙碌的 300ms
+    assert var.try_set(v, 1000, 7) == Ok(7)
+    assert var.get_forever(v) == 7
+  })
+}
+
 // ─────────────────── 永久等待的读写（*_forever） ───────────────────
 
 pub fn get_forever_test() {
@@ -437,6 +479,70 @@ pub fn update_on_dead_value_panics_test() {
     })
 
   assert process.receive(survived, 200) == Error(Nil)
+}
+
+// ─────────────── 关闭（scope 返回时值进程已终止） ───────────────
+//
+// closure 自己 monitor 值进程并等 DOWN，所以 scope 返回时值进程一定
+// 已经终止，不再靠"调用方跑得比对方快"这种调度运气。
+// 下面第 2 条是这条保证的回归测试：把 closure 改回 fire-and-forget
+// （只 send 不等待）它就会失败。
+
+/// scope 返回后立刻检查也必然已死亡（不需要先做一次失败的 get）
+pub fn escaped_var_is_dead_right_after_scope_test() {
+  let escaped = escaped_var()
+  assert var.is_alive(escaped) == False
+}
+
+/// scope 会等值进程真的终止：值进程忙着时，scope 也必须等它处理完关闭消息
+pub fn scope_waits_for_value_process_stop_test() {
+  let started = term.monotonic_ms()
+
+  let assert Ok(Nil) =
+    var.scope(0, fn(v) {
+      // occupy 等到「值进程已经开始忙」就返回，剩下 300ms 是它自己在睡
+      occupy(v, 300)
+      Nil
+    })
+
+  let elapsed = term.monotonic_ms() - started
+  // 回调本身只花几微秒，多出来的时间只能是 scope 在等值进程醒来处理 ValClosure
+  assert elapsed >= 250
+}
+
+/// 当前行为：值进程被卡死时 scope 会一直等（同步关闭的代价）
+///
+/// 同步关闭要等 DOWN，而卡死的值进程永远不会产生 DOWN。
+/// 如果以后给等待加上限（到点放弃），这条测试要跟着改。
+pub fn scope_waits_forever_when_value_process_is_wedged_test() {
+  let returned = process.new_subject()
+
+  let _ =
+    process.spawn_unlinked(fn() {
+      let busy = process.new_subject()
+
+      let assert Ok(Nil) =
+        var.scope(0, fn(v) {
+          // 让另一个进程把值进程永久卡住（回调里自调用 get_forever）
+          let _ =
+            process.spawn_unlinked(fn() {
+              let _ =
+                var.update(v, fn(_) {
+                  // 已经进到值进程的回调里了，从这里开始它不会返回
+                  process.send(busy, Nil)
+                  var.get_forever(v)
+                })
+            })
+          // 用信号而不是 sleep 确认它真的卡住了
+          process.receive_forever(busy)
+          Nil
+        })
+
+      // 能走到这里说明 scope 返回了（与预期不符）
+      process.send(returned, Nil)
+    })
+
+  assert process.receive(returned, 300) == Error(Nil)
 }
 
 // ─────────────────────────── 并发 ───────────────────────────
