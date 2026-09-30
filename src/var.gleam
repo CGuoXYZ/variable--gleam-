@@ -10,7 +10,7 @@ import variable/internal/term.{type Term}
 
 /// 要与可变值交互需要持有此类型
 pub opaque type Var(var) {
-  Var(sub: Subject(ValMSG(var)), pid: Pid)
+  Var(sub: Subject(ValMessage(var)), pid: Pid)
 }
 
 /// 属于[scope](https://variable.hexdocs.pm/var.html#scope)函数的错误类型
@@ -44,15 +44,15 @@ type Val(var) {
   /// val: 值本身
   /// 
   /// subscribe: 携带订阅进程通道的字典
-  Val(val: var, subscribes: Dict(Reference, Subject(SubMSG(var))))
+  Val(val: var, subscribes: Dict(Reference, Subject(SubMessage(var))))
 }
 
 /// 可变值进程接收的消息
-type ValMSG(var) {
+type ValMessage(var) {
   /// 关闭可变值进程
-  ValClosure
+  ValStop
   /// 订阅
-  Subscribe(ref: Reference, sub: Subject(SubMSG(var)))
+  Subscribe(ref: Reference, sub: Subject(SubMessage(var)))
   /// 取消订阅
   Unsubscribe(ref: Reference)
   /// 获取值
@@ -64,11 +64,11 @@ type ValMSG(var) {
 }
 
 /// 订阅进程接收的消息
-type SubMSG(var) {
+type SubMessage(var) {
   /// 关闭订阅进程
-  SubClosure
+  SubStop
   /// 可变值进程已关闭
-  ValClosed
+  ValStopped
   /// 值变化
   ValChange(old_val: var, new_val: var)
 }
@@ -108,15 +108,12 @@ pub fn scope(
     // 启动成功
     Ok(var) -> {
       // 尝试执行回调函数
-      //
+      let return = error.try(fn() { scope(var) })
+      // 等待所有消息处理完毕，随后关闭进程
+      closure(var)
       // 成功返回函数的返回值
       // 失败返回函数的异常
-      use ex <- result.try_recover({
-        // 尝试执行回调，随后关闭可变值进程
-        use <- error.defer(fn() { closure(var) })
-        use <- error.try()
-        scope(var)
-      })
+      use ex <- result.try_recover(return)
       Error(ScopeErr(ex))
     }
   }
@@ -165,12 +162,12 @@ pub fn subscribe(
     let sel =
       process.new_selector()
       |> process.select(sub)
-      |> process.select_specific_monitor(mon, fn(_) { ValClosed })
+      |> process.select_specific_monitor(mon, fn(_) { ValStopped })
 
     // 发送订阅进程的通道
     process.send(ready, sub)
 
-    subscribe_encap(sel, subscribe)
+    subscribe_loop(sel, subscribe)
   })
 
   // 唯一键
@@ -297,7 +294,7 @@ fn closure(var: Var(var)) -> Nil {
     process.new_selector()
     |> process.select_specific_monitor(mon, fn(_) { Nil })
 
-  process.send(var.sub, ValClosure)
+  process.send(var.sub, ValStop)
 
   process.selector_receive_forever(sel)
 }
@@ -309,35 +306,34 @@ fn init(val: var) -> Result(Var(var), StartError) {
 }
 
 /// 创建新的可变值进程
-fn new(val: var) -> Result(Started(Subject(ValMSG(var))), StartError) {
+fn new(val: var) -> Result(Started(Subject(ValMessage(var))), StartError) {
   actor.new(Val(val:, subscribes: dict.new()))
   |> actor.on_message(handle)
   |> actor.start()
 }
 
 /// 封装订阅函数
-fn subscribe_encap(
-  sel: Selector(SubMSG(var)),
+fn subscribe_loop(
+  sel: Selector(SubMessage(var)),
   subscribe: fn(var, var) -> discard,
 ) -> Nil {
   case process.selector_receive_forever(sel) {
     // 关闭消息或可变值进程关闭消息
-    SubClosure | ValClosed -> Nil
+    SubStop | ValStopped -> Nil
     // 值变化消息
     ValChange(old_val:, new_val:) -> {
       // 执行订阅函数
-      error.try(fn() { subscribe(old_val, new_val) })
-      |> discard()
+      let _ = error.try(fn() { subscribe(old_val, new_val) })
 
       // 递归调用，继续接收消息
-      subscribe_encap(sel, subscribe)
+      subscribe_loop(sel, subscribe)
     }
   }
 }
 
 /// 通知订阅函数值已发生变化
 fn notify(
-  subscribe: Dict(Reference, Subject(SubMSG(var))),
+  subscribe: Dict(Reference, Subject(SubMessage(var))),
   old_val: var,
   new_val: var,
 ) -> Nil {
@@ -345,24 +341,28 @@ fn notify(
   process.send(sub, ValChange(old_val:, new_val:))
 }
 
-fn handle(value: Val(var), msg: ValMSG(var)) -> Next(Val(var), ValMSG(var)) {
+fn handle(
+  value: Val(var),
+  msg: ValMessage(var),
+) -> Next(Val(var), ValMessage(var)) {
   let Val(val:, subscribes:) = value
   case msg {
     // 关闭
-    ValClosure -> actor.stop()
+    ValStop -> actor.stop()
     // 订阅
     Subscribe(ref:, sub:) ->
-      Val(val:, subscribes: dict.insert(subscribes, ref, sub))
+      Val(..value, subscribes: dict.insert(subscribes, ref, sub))
       |> actor.continue()
     // 取消订阅
     Unsubscribe(ref:) -> {
-      // 从字典中删除该订阅并通知其关闭
-      discard({
-        use sub <- result.try(dict.get(subscribes, ref))
-        process.send(sub, SubClosure) |> Ok()
-      })
+      // 通知该订阅关闭
+      case dict.get(subscribes, ref) {
+        Error(_) -> Nil
+        Ok(sub) -> process.send(sub, SubStop)
+      }
 
-      Val(val:, subscribes: dict.delete(subscribes, ref))
+      // 从字典中删除该订阅
+      Val(..value, subscribes: dict.delete(subscribes, ref))
       |> actor.continue()
     }
     // 获取值
@@ -380,7 +380,7 @@ fn handle(value: Val(var), msg: ValMSG(var)) -> Next(Val(var), ValMSG(var)) {
       process.send(sub, new_val)
       notify(subscribes, val, new_val)
 
-      Val(val: new_val, subscribes:)
+      Val(..value, val: new_val)
       |> actor.continue()
     }
     // 使用给定函数更新值
@@ -397,16 +397,9 @@ fn handle(value: Val(var), msg: ValMSG(var)) -> Next(Val(var), ValMSG(var)) {
           process.send(sub, Ok(new_val))
           notify(subscribes, val, new_val)
 
-          Val(val: new_val, subscribes:)
+          Val(..value, val: new_val)
           |> actor.continue()
         }
       }
   }
-}
-
-/// 用不到的值需要用 let _ = ... 消除警告
-/// 
-/// 可用这个函数替代
-fn discard(_) -> Nil {
-  Nil
 }
